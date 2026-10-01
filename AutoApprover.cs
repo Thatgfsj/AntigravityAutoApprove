@@ -563,7 +563,7 @@ namespace AntigravityAutoApprove
                     TextFormatFlags.VerticalCenter | TextFormatFlags.Left);
                 string cnt = "已批准 " + _watcher.Clicked + " 次";
                 TextRenderer.DrawText(g, cnt, new Font("Microsoft YaHei UI", 8.5f),
-                    new Rectangle(_header.Width - 170, 0, 140, 54),
+                    new Rectangle(_header.Width - 268, 0, 168, 54),
                     Color.FromArgb(219, 234, 254),
                     TextFormatFlags.VerticalCenter | TextFormatFlags.Right);
             };
