@@ -1,9 +1,12 @@
 // ============================================================================
-//  AntigravityAutoApprove  v3
+//  AntigravityAutoApprove  v5
 //  后台静默自动点击 Antigravity(Google 反重力 IDE) 的 Agent 权限批准弹窗。
 //  策略: 一直选第 1 项 "Yes, allow this time"(选A); 两段式弹窗自动补点 Submit。
-//  v3: 蓝白主题自绘UI / 400ms 哨兵轮询提速 / 后台(遮挡/最小化)安全点击 /
-//      坐标兜底前校验落点归属, 被遮挡时短暂置前并还原 / 队列弹窗连点 / 打开日志。
+//  双管道:
+//   [UIA]  每400ms扫描窗口树, 仅点击支持 Invoke/Selection/Toggle 模式的元素
+//          (绝不抢焦点、绝不移动鼠标、绝不改前台窗口 —— 无感知);
+//   [CDP]  经 Antigravity 自带调试协议(DevToolsActivePort)在页面内执行 JS 点击,
+//          窗口最小化/遮挡/虚拟桌面均有效, 且自动 reload 加载失败的错误页。
 //  编译: build.cmd (系统自带 .NET Framework 4.x 编译器, 零依赖)
 // ============================================================================
 using System;
@@ -13,7 +16,11 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
 using System.Linq;
+using System.Net;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Automation;
 using System.Windows.Forms;
@@ -49,17 +56,17 @@ namespace AntigravityAutoApprove
         }
     }
 
-    // ------------------------------ UI 基础控件 ------------------------------
+    // ------------------------------ UI 基础 ------------------------------
     internal static class Ui
     {
-        public static readonly Color Primary = Color.FromArgb(37, 99, 235);      // #2563EB
-        public static readonly Color PrimaryHover = Color.FromArgb(29, 78, 216); // #1D4ED8
-        public static readonly Color PrimaryLight = Color.FromArgb(219, 234, 254); // #DBEAFE
-        public static readonly Color Bg = Color.FromArgb(247, 250, 255);         // #F7FAFF
-        public static readonly Color TextMain = Color.FromArgb(15, 23, 42);      // #0F172A
-        public static readonly Color TextSub = Color.FromArgb(100, 116, 139);    // #64748B
-        public static readonly Color Ok = Color.FromArgb(22, 163, 74);           // #16A34A
-        public static readonly Color OffTrack = Color.FromArgb(203, 213, 225);   // #CBD5E1
+        public static readonly Color Primary = Color.FromArgb(37, 99, 235);
+        public static readonly Color PrimaryHover = Color.FromArgb(29, 78, 216);
+        public static readonly Color PrimaryLight = Color.FromArgb(219, 234, 254);
+        public static readonly Color Bg = Color.FromArgb(247, 250, 255);
+        public static readonly Color TextMain = Color.FromArgb(15, 23, 42);
+        public static readonly Color TextSub = Color.FromArgb(100, 116, 139);
+        public static readonly Color Ok = Color.FromArgb(22, 163, 74);
+        public static readonly Color OffTrack = Color.FromArgb(203, 213, 225);
 
         public static GraphicsPath RoundedPath(Rectangle r, int radius)
         {
@@ -74,7 +81,6 @@ namespace AntigravityAutoApprove
         }
     }
 
-    // 现代拨动开关(轨道+文字, 整体可点击)
     public class ToggleSwitch : Control
     {
         private bool _checked;
@@ -117,14 +123,12 @@ namespace AntigravityAutoApprove
             using (SolidBrush b = new SolidBrush(Color.White))
             { g.FillEllipse(b, kx, track.Y + 2, 18, 18); }
             TextRenderer.DrawText(g, Text, Font, new Rectangle(58, 0, Width - 60, Height),
-                Enabled ? Ui.TextMain : Ui.TextSub,
-                TextFormatFlags.VerticalCenter | TextFormatFlags.Left);
+                Ui.TextMain, TextFormatFlags.VerticalCenter | TextFormatFlags.Left);
         }
         protected override void OnPaintBackground(PaintEventArgs e) { }
         protected override void OnClick(EventArgs e) { Checked = !Checked; base.OnClick(e); }
     }
 
-    // 圆角按钮
     public class RoundedButton : Control
     {
         public Color NormalColor = Ui.Primary;
@@ -151,7 +155,7 @@ namespace AntigravityAutoApprove
             Rectangle r = new Rectangle(0, 0, Width - 1, Height - 1);
             using (GraphicsPath gp = Ui.RoundedPath(r, 8))
             {
-                if (LabelColor == Ui.TextMain) // 浅色按钮
+                if (LabelColor == Ui.TextMain)
                 {
                     using (SolidBrush b = new SolidBrush(_hover ? Ui.PrimaryLight : Color.FromArgb(241, 245, 249)))
                     using (Pen pen = new Pen(Ui.PrimaryLight))
@@ -169,10 +173,41 @@ namespace AntigravityAutoApprove
         protected override void OnPaintBackground(PaintEventArgs e) { }
     }
 
+    // 标题栏小按钮: 底色必须与渐变右端一致, 否则出现花屏
+    public class HeaderButton : Control
+    {
+        private bool _hover;
+        public HeaderButton(string text, int width)
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
+            Text = text;
+            Size = new Size(width, 54);
+            Cursor = Cursors.Hand;
+            Font = new Font("Segoe UI", 10f);
+        }
+        protected override void OnMouseEnter(EventArgs e) { _hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { _hover = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.Clear(Color.FromArgb(56, 125, 244));   // 渐变在 x≈420-500 处的颜色
+            if (_hover)
+            {
+                using (SolidBrush b = new SolidBrush(Color.FromArgb(50, 255, 255, 255)))
+                { g.FillRectangle(b, ClientRectangle); }
+            }
+            TextRenderer.DrawText(g, Text, Font, ClientRectangle, Color.White,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+        }
+        protected override void OnPaintBackground(PaintEventArgs e) { }
+    }
+
     // ------------------------------ 配置持久化 ------------------------------
     public class AppConfig
     {
         public bool Enabled;
+        public bool Verbose;
 
         private static string Dir
         {
@@ -206,6 +241,7 @@ namespace AntigravityAutoApprove
                         string[] kv = line.Split('=');
                         if (kv.Length < 2) continue;
                         if (kv[0] == "enabled") c.Enabled = kv[1].Trim() == "1";
+                        else if (kv[0] == "verbose") c.Verbose = kv[1].Trim() == "1";
                     }
                 }
             }
@@ -237,10 +273,20 @@ namespace AntigravityAutoApprove
         private int _tick;
         public bool EnabledFlag;
         public bool SelfTest;
-        public static bool Verbose;
         public int Clicked;
         public Action<string> StatusChanged;
         public Action ClickedChanged;
+
+        // 在页面里执行: 错误页自愈 / 穿透 shadow DOM 找第1个 Yes 选项点击 / 两段式 Submit
+        private const string CdpJs =
+            "(function(){" +
+            "if(location.href.indexOf('chrome-error')===0){if(!window.__agyH||Date.now()-window.__agyH>5000){window.__agyH=Date.now();location.reload();return 'HEAL';}return 'N';}" +
+            "function deep(r,o){var e=r.querySelectorAll('*');for(var i=0;i<e.length;i++){o.push(e[i]);if(e[i].shadowRoot)deep(e[i].shadowRoot,o);}return o;}" +
+            "var a=deep(document,[]);" +
+            "function row(pre){for(var i=a.length-1;i>=0;i--){var t=(a[i].textContent||'').replace(/\\s+/g,' ').trim();if(t.indexOf(pre)>=0){var c=a[i].closest('a,button,[role=button],[role=option],[role=listitem],li,div');return c||a[i];}}return null;}" +
+            "var y=row('Yes, allow');if(y){y.click();window.__agyT=Date.now();return 'C1';}" +
+            "if(window.__agyT&&Date.now()-window.__agyT<1500){var s=row('Submit');if(s){s.click();window.__agyT=0;return 'S1';}return 'W';}" +
+            "return 'N';})()";
 
         public void Start()
         {
@@ -267,37 +313,11 @@ namespace AntigravityAutoApprove
                 if (!EnabledFlag) return;
                 _tick++;
 
-                HashSet<int> pidSet = new HashSet<int>();
-                if (SelfTest)
-                {
-                    pidSet.Add(Process.GetCurrentProcess().Id);
-                }
-                else
-                {
-                    Process[] ps = Process.GetProcessesByName("Antigravity");
-                    if (ps.Length == 0) { SetStatus("运行中 · 等待 Antigravity 启动…"); return; }
-                    foreach (Process p in ps) pidSet.Add(p.Id);
-                }
+                bool anyWindow = UiaPass();
+                if (!SelfTest) CdpPass();
 
-                int windowsSeen = 0;
-                AutomationElementCollection roots = AutomationElement.RootElement.FindAll(TreeScope.Children, Condition.TrueCondition);
-                foreach (AutomationElement win in roots)
-                {
-                    int pid;
-                    try { pid = win.Current.ProcessId; } catch { continue; }
-                    if (!pidSet.Contains(pid)) continue;
-                    string wname;
-                    try { wname = win.Current.Name ?? ""; } catch { continue; }
-                    if (!SelfTest && wname.Contains("自动批准")) continue;
-
-                    windowsSeen++;
-                    ApproveInWindow(win);
-                }
-
-                if (windowsSeen > 0 && Clicked == 0)
-                    SetStatus("运行中 · 正在监视 Antigravity，等待权限弹窗…");
-                else if (windowsSeen == 0)
-                    SetStatus("运行中 · 未发现 Antigravity 窗口");
+                if (Clicked == 0)
+                    SetStatus(anyWindow ? "运行中 · 正在监视 Antigravity（含后台/最小化）…" : "运行中 · 等待 Antigravity 启动…");
             }
             catch (Exception ex)
             {
@@ -306,183 +326,137 @@ namespace AntigravityAutoApprove
             finally { Interlocked.Exchange(ref _busy, 0); }
         }
 
-        // 全量扫描: 找第 1 个 "Yes, allow"(=选项A) 与 Submit
-        // 注: 不用 CacheRequest(实测其缓存引用会让 Invoke 慢至秒级并卡死后续轮次)
+        // ---------- UIA 管道: 仅模式点击, 零干扰 ----------
+        private bool UiaPass()
+        {
+            HashSet<int> pidSet = new HashSet<int>();
+            if (SelfTest) { pidSet.Add(Process.GetCurrentProcess().Id); return UiaScan(pidSet); }
+            Process[] ps = Process.GetProcessesByName("Antigravity");
+            if (ps.Length == 0) return false;
+            foreach (Process p in ps) pidSet.Add(p.Id);
+            return UiaScan(pidSet);
+        }
+
+        private bool UiaScan(HashSet<int> pidSet)
+        {
+            int windowsSeen = 0;
+            AutomationElementCollection roots = AutomationElement.RootElement.FindAll(TreeScope.Children, Condition.TrueCondition);
+            foreach (AutomationElement win in roots)
+            {
+                int pid;
+                try { pid = win.Current.ProcessId; } catch { continue; }
+                if (!pidSet.Contains(pid)) continue;
+                string wname;
+                try { wname = win.Current.Name ?? ""; } catch { continue; }
+                if (!SelfTest && wname.Contains("自动批准")) continue;
+                windowsSeen++;
+                ApproveInWindow(win);
+            }
+            return windowsSeen > 0;
+        }
+
+        // 找第 1 个 "Yes, allow"(=选项A) 与 Submit; Yes 优先选支持点击模式的元素
         private static void ScanOnce(AutomationElement win, out AutomationElement firstYes, out AutomationElement submit, out string yesName)
         {
             firstYes = null; submit = null; yesName = "";
             AutomationElementCollection all;
             try { all = win.FindAll(TreeScope.Descendants, Condition.TrueCondition); }
-            catch (Exception ex) { if (Verbose) AppConfig.Log("SCAN ERR: " + ex.Message); return; }
+            catch (Exception ex) { if (Watcher.Verbose) AppConfig.Log("SCAN ERR: " + ex.Message); return; }
             if (all == null) return;
-            foreach (AutomationElement e in all)
+
+            List<AutomationElement> yesCandidates = new List<AutomationElement>();
+            for (int i = 0; i < all.Count; i++)
             {
+                AutomationElement e = all[i];
                 string n;
                 try { n = e.Current.Name; } catch { continue; }
                 if (string.IsNullOrEmpty(n)) continue;
-                if (firstYes == null && n.IndexOf("Yes, allow", StringComparison.OrdinalIgnoreCase) >= 0)
-                {
-                    firstYes = e;
-                    yesName = n.Length > 60 ? n.Substring(0, 60) + "…" : n;
-                }
-                else if (submit == null && n.IndexOf("Submit", StringComparison.OrdinalIgnoreCase) >= 0)
-                {
-                    submit = e;
-                }
-                if (firstYes != null && submit != null) break;
+                if (n.IndexOf("Yes, allow", StringComparison.OrdinalIgnoreCase) >= 0) yesCandidates.Add(e);
+                else if (submit == null && n.IndexOf("Submit", StringComparison.OrdinalIgnoreCase) >= 0) submit = e;
             }
-            if (Verbose) AppConfig.Log("SCAN total=" + all.Count + " yes=" + (firstYes != null) + " sub=" + (submit != null));
-        }
+            if (yesCandidates.Count == 0) return;
 
-        // 哨兵查询(原生侧过滤, 只回传命中元素, 空闲时近零开销)。
-        // 注: 已实测 Chromium 提供方 Invoke 仅 ~55ms; 自检里 WinForms 控件同进程
-        //     作为提供方时 Invoke 会延迟 4s+, 那是测试夹具的怪癖, 与真实目标无关。
-        private static bool DialogProbablyOpen(AutomationElement win)
-        {
-            try
+            // 优先: 有 Invoke/Selection/Toggle 模式的元素(可无感点击)
+            foreach (AutomationElement e in yesCandidates)
             {
-                OrCondition cond = new OrCondition(
-                    new PropertyCondition(AutomationElement.NameProperty, "Skip"),
-                    new PropertyCondition(AutomationElement.NameProperty, "Submit"),
-                    new PropertyCondition(AutomationElement.NameProperty, "Yes, allow this time"));
-                return win.FindAll(TreeScope.Descendants, cond).Count > 0;
+                object p;
+                try { if (e.TryGetCurrentPattern(InvokePattern.Pattern, out p)) { firstYes = e; break; } } catch { }
+                try { if (e.TryGetCurrentPattern(SelectionItemPattern.Pattern, out p)) { firstYes = e; break; } } catch { }
+                try { if (e.TryGetCurrentPattern(TogglePattern.Pattern, out p)) { firstYes = e; break; } } catch { }
             }
-            catch { return false; }
+            if (firstYes == null) firstYes = yesCandidates[0];
+
+            yesName = "";
+            try { string n = firstYes.Current.Name; yesName = n.Length > 60 ? n.Substring(0, 60) + "…" : n; } catch { }
+            if (Watcher.Verbose) AppConfig.Log("SCAN yes=" + (firstYes != null) + " sub=" + (submit != null) + " candidates=" + yesCandidates.Count);
         }
 
-        // 批准窗口内的弹窗: 哨兵命中才全量扫描; 每 5 个 tick(约2s)强制扫一次兜底,
-        // 防止弹窗元素的可访问名与哨兵词不完全一致时漏检。
         private void ApproveInWindow(AutomationElement win)
         {
-            if (!DialogProbablyOpen(win) && _tick % 5 != 0) return;
-
             AutomationElement firstYes, submit; string yesName;
             ScanOnce(win, out firstYes, out submit, out yesName);
-            if (firstYes == null)
-            {
-                if (Verbose) AppConfig.Log("ROUND: no dialog elements");
-                return;
-            }
+            if (firstYes == null) return;
 
-            if (Click(firstYes, win))
+            if (Click(firstYes))
             {
                 Clicked++;
                 AppConfig.Log("APPROVED(#" + Clicked + "): " + yesName);
                 Action ch = ClickedChanged; if (ch != null) ch();
                 SetStatus("运行中 · 已自动批准 " + Clicked + " 次 ✓");
-                // 两段式弹窗: 若 Submit 仍在, 250ms 后补点
                 if (submit != null)
                 {
                     Thread.Sleep(250);
-                    try { if (Click(submit, win)) AppConfig.Log("SUBMIT clicked"); } catch { }
+                    try { if (Click(submit)) AppConfig.Log("SUBMIT clicked"); } catch { }
                 }
             }
             else
             {
-                AppConfig.Log("CLICK FAILED: " + yesName);
+                AppConfig.Log("UIA CLICK FAILED(留给CDP管道): " + yesName);
             }
         }
 
-        // 静默点击: UIA 模式优先(无需前台, 后台/遮挡/最小化均可), 坐标兜底(校验落点归属)
-        private static bool Click(AutomationElement el, AutomationElement win)
+        // 仅无障碍模式点击: 不动鼠标、不改前台、不判坐标 —— 任何失败都交给 CDP 管道
+        private static bool Click(AutomationElement el)
         {
             object p;
-            if (Verbose) AppConfig.Log("CLICK: enter");
-            try
-            {
-                p = el.GetCurrentPattern(InvokePattern.Pattern);
-                if (p is InvokePattern)
-                {
-                    if (Verbose) AppConfig.Log("CLICK: got InvokePattern");
-                    ((InvokePattern)p).Invoke();
-                    if (Verbose) AppConfig.Log("CLICK: invoked ok");
-                    return true;
-                }
-            }
-            catch (Exception ex) { if (Verbose) AppConfig.Log("INVOKE ERR: " + ex.Message); }
+            try { p = el.GetCurrentPattern(InvokePattern.Pattern); if (p is InvokePattern) { ((InvokePattern)p).Invoke(); return true; } } catch { }
             try { p = el.GetCurrentPattern(SelectionItemPattern.Pattern); if (p is SelectionItemPattern) { ((SelectionItemPattern)p).Select(); return true; } } catch { }
             try { p = el.GetCurrentPattern(TogglePattern.Pattern); if (p is TogglePattern) { ((TogglePattern)p).Toggle(); return true; } } catch { }
+            return false;
+        }
 
-            // 坐标兜底: 先确认落点属于 Antigravity 顶层窗口, 被遮挡时短暂置前
-            try
+        // ---------- CDP 管道: 后台/最小化/遮挡均有效 + 错误页自愈 ----------
+        private DateTime _lastHeal;
+        private int _nullCount;
+
+        private void CdpPass()
+        {
+            string r = Cdp.Evaluate(CdpJs);
+            if (Verbose)
             {
-                System.Windows.Point pt;
-                try { pt = el.GetClickablePoint(); }
-                catch
-                {
-                    System.Windows.Rect r = el.Current.BoundingRectangle;
-                    if (r.IsEmpty || r.Width <= 0 || r.Height <= 0) return false;
-                    pt = new System.Windows.Point(r.X + r.Width / 2, r.Y + r.Height / 2);
-                }
-                IntPtr root = IntPtr.Zero;
-                try { root = (IntPtr)win.Current.NativeWindowHandle; } catch { }
-                if (root == IntPtr.Zero) return false;
-
-                if (!PointBelongsToRoot(pt.X, pt.Y, root))
-                {
-                    IntPtr prev = GetForegroundWindow();
-                    try
-                    {
-                        ShowWindow(root, 9); // SW_RESTORE
-                        SetForegroundWindow(root);
-                        Thread.Sleep(120);
-                    }
-                    catch { }
-                    bool owned = PointBelongsToRoot(pt.X, pt.Y, root);
-                    if (!owned)
-                    {
-                        if (prev != IntPtr.Zero) { try { SetForegroundWindow(prev); } catch { } }
-                        AppConfig.Log("COORD CLICK SKIPPED: point covered by another window");
-                        return false; // 不盲点, 避免点到别的程序
-                    }
-                    PhysicalClick(pt.X, pt.Y);
-                    if (prev != IntPtr.Zero) { try { SetForegroundWindow(prev); } catch { } }
-                    return true;
-                }
-                PhysicalClick(pt.X, pt.Y);
-                return true;
+                _nullCount = (r == null) ? _nullCount + 1 : 0;
+                if (r != null) AppConfig.Log("CDP EVAL: " + r);
+                else if (_nullCount % 25 == 1) AppConfig.Log("CDP EVAL: null (x" + _nullCount + ")");
             }
-            catch { return false; }
+            if (r == "C1")
+            {
+                Clicked++;
+                AppConfig.Log("CDP APPROVED(#" + Clicked + ")");
+                Action ch = ClickedChanged; if (ch != null) ch();
+                SetStatus("运行中 · 已自动批准 " + Clicked + " 次 ✓");
+            }
+            else if (r == "S1") AppConfig.Log("CDP SUBMIT clicked");
+            else if (r == "HEAL")
+            {
+                if ((DateTime.UtcNow - _lastHeal).TotalSeconds > 6)
+                {
+                    _lastHeal = DateTime.UtcNow;
+                    AppConfig.Log("CDP: 检测到错误页, 已自动重载 Antigravity 界面");
+                }
+            }
         }
 
-        private static bool PointBelongsToRoot(double x, double y, IntPtr root)
-        {
-            POINT p = new POINT(); p.X = (int)x; p.Y = (int)y;
-            IntPtr hit = WindowFromPoint(p);
-            IntPtr hitRoot = GetAncestor(hit, 2); // GA_ROOT
-            return hitRoot == root;
-        }
-
-        private static void PhysicalClick(double x, double y)
-        {
-            POINT old;
-            GetCursorPos(out old);
-            SetCursorPos((int)x, (int)y);
-            mouse_event(0x02, 0, 0, 0, UIntPtr.Zero);
-            Thread.Sleep(30);
-            mouse_event(0x04, 0, 0, 0, UIntPtr.Zero);
-            SetCursorPos(old.X, old.Y);
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct POINT { public int X; public int Y; }
-
-        [DllImport("user32.dll")]
-        private static extern IntPtr WindowFromPoint(POINT p);
-        [DllImport("user32.dll")]
-        private static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
-        [DllImport("user32.dll")]
-        private static extern bool GetCursorPos(out POINT p);
-        [DllImport("user32.dll")]
-        private static extern bool SetCursorPos(int x, int y);
-        [DllImport("user32.dll")]
-        private static extern void mouse_event(uint f, uint dx, uint dy, uint d, UIntPtr e);
-        [DllImport("user32.dll")]
-        private static extern IntPtr GetForegroundWindow();
-        [DllImport("user32.dll")]
-        private static extern bool SetForegroundWindow(IntPtr h);
-        [DllImport("user32.dll")]
-        private static extern bool ShowWindow(IntPtr h, int cmd);
+        public static bool Verbose;
     }
 
     // ------------------------------ 主窗口(蓝白主题) ------------------------------
@@ -497,7 +471,6 @@ namespace AntigravityAutoApprove
         private Panel _card;
         private ToggleSwitch _tglEnabled;
         private ToggleSwitch _tglAutostart;
-        private Label _lblHint;
         private NotifyIcon _tray;
         private bool _allowClose;
         private string _statusText = "未启动";
@@ -526,13 +499,12 @@ namespace AntigravityAutoApprove
             Load += delegate { ApplyRounded(); };
             Resize += delegate { ApplyRounded(); };
 
-            _tglEnabled.Checked = _cfg.Enabled;
-            ApplyEnabledState(false);
-            _tglAutostart.Checked = IsAutostartOn();
+            ApplyEnabledState();
 
             _watcher.StatusChanged = delegate (string s) { UpdateStatus(s); };
             _watcher.ClickedChanged = delegate { _header.Refresh(); };
             _watcher.EnabledFlag = _cfg.Enabled;
+            Watcher.Verbose = _cfg.Verbose;
             if (_cfg.Enabled) _watcher.Start();
 
             if (minimized) HideToTray();
@@ -544,7 +516,6 @@ namespace AntigravityAutoApprove
             { Region = new Region(gp); }
         }
 
-        // ------- 标题栏(蓝色渐变, 可拖动) -------
         private void BuildHeader()
         {
             _header = new Panel { Left = 0, Top = 0, Width = 500, Height = 54 };
@@ -555,11 +526,15 @@ namespace AntigravityAutoApprove
                 using (LinearGradientBrush b = new LinearGradientBrush(_header.ClientRectangle,
                     Color.FromArgb(37, 99, 235), Color.FromArgb(59, 130, 246), 0f))
                 { g.FillRectangle(b, _header.ClientRectangle); }
-                g.FillEllipse(Brushes.White, 16, 19, 16, 16);
-                g.FillEllipse(Brushes.White, 20, 23, 8, 8);
+                // logo: 白色圆角方块 + 蓝色 A
+                using (GraphicsPath gp = Ui.RoundedPath(new Rectangle(14, 15, 24, 24), 6))
+                { g.FillPath(Brushes.White, gp); }
+                TextRenderer.DrawText(g, "A", new Font("Segoe UI", 11f, FontStyle.Bold),
+                    new Rectangle(14, 13, 24, 26), Ui.Primary,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
                 TextRenderer.DrawText(g, "Antigravity 自动批准",
                     new Font("Microsoft YaHei UI", 10.5f, FontStyle.Bold),
-                    new Rectangle(42, 0, 300, 54), Color.White,
+                    new Rectangle(46, 0, 240, 54), Color.White,
                     TextFormatFlags.VerticalCenter | TextFormatFlags.Left);
                 string cnt = "已批准 " + _watcher.Clicked + " 次";
                 TextRenderer.DrawText(g, cnt, new Font("Microsoft YaHei UI", 8.5f),
@@ -574,28 +549,18 @@ namespace AntigravityAutoApprove
             HeaderButton btnClose = new HeaderButton("✕", 40);
             btnClose.Location = new Point(500 - 44, 0);
             btnClose.Click += delegate { HideToTray(); };
-
             _header.Controls.Add(btnMin);
             _header.Controls.Add(btnClose);
             _header.MouseDown += delegate (object s, MouseEventArgs e)
             {
                 if (e.Button == MouseButtons.Left) { ReleaseCapture(); SendMessage(Handle, 0xA1, 0x2, 0); }
             };
-            foreach (Control c in _header.Controls)
-            {
-                c.MouseDown += delegate (object s, MouseEventArgs e)
-                {
-                    if (e.Button == MouseButtons.Left) { ReleaseCapture(); SendMessage(Handle, 0xA1, 0x2, 0); }
-                };
-            }
             Controls.Add(_header);
             _header.BringToFront();
         }
 
-        // ------- 主体 -------
         private void BuildBody()
         {
-            // 状态卡片
             _card = new Panel { Left = 16, Top = 68, Width = 468, Height = 62 };
             _card.Paint += delegate (object s, PaintEventArgs e)
             {
@@ -613,42 +578,35 @@ namespace AntigravityAutoApprove
                     new Rectangle(36, 0, 300, _card.Height), Ui.TextMain,
                     TextFormatFlags.VerticalCenter | TextFormatFlags.Left);
                 TextRenderer.DrawText(g, "已自动批准", new Font("Microsoft YaHei UI", 8f),
-                    new Rectangle(_card.Width - 120, 11, 104, 16), Ui.TextSub,
-                    TextFormatFlags.Right);
+                    new Rectangle(_card.Width - 120, 11, 104, 16), Ui.TextSub, TextFormatFlags.Right);
                 TextRenderer.DrawText(g, _watcher.Clicked + " 次", new Font("Microsoft YaHei UI", 13f, FontStyle.Bold),
-                    new Rectangle(_card.Width - 120, 25, 104, 30), Ui.Primary,
-                    TextFormatFlags.Right);
+                    new Rectangle(_card.Width - 120, 25, 104, 30), Ui.Primary, TextFormatFlags.Right);
             };
             Controls.Add(_card);
 
-            // 开关
             _tglEnabled = new ToggleSwitch { Left = 18, Top = 146, Width = 464, Height = 30, Text = "自动批准（后台静默 · 一直选第 1 项 Yes, allow this time）" };
+            _tglEnabled.Checked = _cfg.Enabled;
             _tglEnabled.CheckedChanged += delegate
             {
                 _cfg.Enabled = _tglEnabled.Checked;
                 _cfg.Save();
-                ApplyEnabledState(true);
+                ApplyEnabledState();
             };
             Controls.Add(_tglEnabled);
 
             _tglAutostart = new ToggleSwitch { Left = 18, Top = 182, Width = 464, Height = 30, Text = "开机自动启动（静默模式，直接最小化到托盘）" };
+            _tglAutostart.Checked = IsAutostartOn();
             _tglAutostart.CheckedChanged += delegate { SetAutostart(_tglAutostart.Checked); };
             Controls.Add(_tglAutostart);
 
-            _lblHint = new Label
+            Label lblHint = new Label
             {
-                Left = 18,
-                Top = 216,
-                Width = 300,
-                Height = 16,
-                Text = "Antigravity 在后台/被遮挡时同样可以自动点击",
-                ForeColor = Ui.TextSub,
-                Font = new Font("Microsoft YaHei UI", 8f),
-                BackColor = Color.Transparent
+                Left = 18, Top = 216, Width = 460, Height = 16,
+                Text = "最小化/遮挡/虚拟桌面均可自动点击（UIA + CDP 双通道）",
+                ForeColor = Ui.TextSub, Font = new Font("Microsoft YaHei UI", 8f), BackColor = Color.Transparent
             };
-            Controls.Add(_lblHint);
+            Controls.Add(lblHint);
 
-            // 底部按钮
             RoundedButton btnHide = new RoundedButton { Left = 16, Top = 236, Width = 170, Height = 32, Text = "隐藏到托盘继续运行" };
             btnHide.Click += delegate { HideToTray(); };
             RoundedButton btnLog = new RoundedButton { Left = 196, Top = 236, Width = 110, Height = 32, Text = "打开日志", NormalColor = Color.FromArgb(241, 245, 249), HoverColor = Ui.PrimaryLight, LabelColor = Ui.TextMain };
@@ -681,7 +639,7 @@ namespace AntigravityAutoApprove
             _tray.DoubleClick += delegate { ShowFromTray(); };
         }
 
-        private void ApplyEnabledState(bool announce)
+        private void ApplyEnabledState()
         {
             _watching = _cfg.Enabled;
             _watcher.EnabledFlag = _cfg.Enabled;
@@ -700,7 +658,7 @@ namespace AntigravityAutoApprove
                     string trayText = "Antigravity 自动批准 · " + s;
                     _tray.Text = trayText.Length > 63 ? trayText.Substring(0, 63) : trayText;
                     _card.Invalidate();
-                    _header.Invalidate();
+                    _header.Refresh();
                 });
             }
             catch { }
@@ -725,7 +683,7 @@ namespace AntigravityAutoApprove
             if (!_allowClose)
             {
                 e.Cancel = true;
-                HideToTray();   // 点 ✕ = 静默后台继续运行
+                HideToTray();
                 return;
             }
             _tray.Visible = false;
@@ -756,37 +714,7 @@ namespace AntigravityAutoApprove
         private static extern int SendMessage(IntPtr h, int m, int w, int l);
     }
 
-    // 标题栏小按钮
-    public class HeaderButton : Control
-    {
-        private bool _hover;
-        public HeaderButton(string text, int width)
-        {
-            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
-                     ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
-            Text = text;
-            Size = new Size(width, 54);
-            Cursor = Cursors.Hand;
-            Font = new Font("Segoe UI", 10f);
-        }
-        protected override void OnMouseEnter(EventArgs e) { _hover = true; Invalidate(); base.OnMouseEnter(e); }
-        protected override void OnMouseLeave(EventArgs e) { _hover = false; Invalidate(); base.OnMouseLeave(e); }
-        protected override void OnPaint(PaintEventArgs e)
-        {
-            Graphics g = e.Graphics;
-            if (_hover)
-            {
-                using (SolidBrush b = new SolidBrush(Color.FromArgb(40, 255, 255, 255)))
-                { g.FillRectangle(b, ClientRectangle); }
-            }
-            TextRenderer.DrawText(g, Text, Font, ClientRectangle, Color.White,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
-        }
-        protected override void OnPaintBackground(PaintEventArgs e) { }
-    }
-
     // ------------------------------ 自检模式 ------------------------------
-    // --selftest: 生成仿真弹窗(数字前缀选项 + Submit + No), 验证自动批准全流程
     internal static class SelfTest
     {
         public static void Run()
@@ -800,8 +728,6 @@ namespace AntigravityAutoApprove
             form.StartPosition = FormStartPosition.Manual;
             form.Left = 40; form.Top = 40;
 
-            string deliveryLog = Path.Combine(Path.GetTempPath(), "agy_delivery_test.log");
-            File.WriteAllText(deliveryLog, "");
             string[] names = new string[]
             {
                 "1 Yes, allow this time",
@@ -815,22 +741,10 @@ namespace AntigravityAutoApprove
             {
                 string captured = n;
                 Button b = new Button { Left = 10, Top = y, Width = 650, Height = 34, Text = n };
-                b.Click += delegate
-                {
-                    File.AppendAllText(log, "CLICKED::" + captured + Environment.NewLine);
-                    File.AppendAllText(deliveryLog, "DELIVERED " + DateTime.Now.ToString("HH:mm:ss.fff") + " " + captured + Environment.NewLine);
-                };
+                b.Click += delegate { File.AppendAllText(log, "CLICKED::" + captured + Environment.NewLine); };
                 form.Controls.Add(b);
                 y += 45;
             }
-            // UI 线程心跳: 验证消息泵是否畅通
-            System.Windows.Forms.Timer hb = new System.Windows.Forms.Timer();
-            hb.Interval = 500;
-            hb.Tick += delegate
-            {
-                File.AppendAllText(deliveryLog, "UI-PUMP " + DateTime.Now.ToString("HH:mm:ss.fff") + Environment.NewLine);
-            };
-            hb.Start();
 
             Watcher w = new Watcher();
             w.SelfTest = true;

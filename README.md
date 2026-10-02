@@ -6,7 +6,9 @@
 
 ## ✨ 功能特性
 
-- **后台静默运行** — 最小化到系统托盘，无窗口干扰；Antigravity 在后台/被遮挡/最小化时同样可以自动点击
+- **后台静默运行** — 最小化到系统托盘，无窗口干扰
+- **双通道点击** — UIA 无障碍接口（前台即时）+ CDP 调试协议（最小化/遮挡/虚拟桌面均有效），全程不抢焦点、不动鼠标
+- **错误页自愈** — Antigravity 内部界面加载失败出现错误页时（TUN 等网络环境下常见），自动通过 CDP 重载恢复
 - **固定选 A** — 永远自动选择第 1 项 "Yes, allow this time"（仅本次批准），权限不残留
 - **两段式弹窗兜底** — 点完选项后若 Submit 按钮仍在，自动补点
 - **三重点击机制** — UIA Invoke/SelectionItem/Toggle 模式优先（无障碍接口，不抢焦点），坐标点击兜底（点击前校验落点归属，被其他窗口遮挡时短暂置前再还原，绝不误点别的程序）
@@ -45,10 +47,18 @@ build.cmd
 
 ## 🔧 工作原理
 
-1. 每 400ms 用 UIA **哨兵查询**（原生侧过滤，空闲时近乎零开销）探测 Antigravity 窗口内是否存在 `Skip` / `Submit` / `Yes, allow this time` 元素
-2. 命中后全量扫描可访问树，找到名字包含 `Yes, allow` 的**任意类型元素**（真实弹窗选项是带数字前缀的列表行，不是标准按钮），取树序第一个即第 1 项
-3. 通过无障碍接口静默点击；每 5 个 tick 强制全量扫描一次兜底，防止元素命名不一致漏检
-4. 点击后检查 Submit 是否仍在（两段式弹窗），250ms 后补点
+**UIA 管道（前台即时响应）**
+
+1. 每 400ms 扫描 Antigravity 窗口的可访问树，找到名字包含 `Yes, allow` 的**任意类型元素**（真实弹窗选项是带数字前缀的列表行，不是标准按钮），优先选支持 Invoke/Selection 模式的元素
+2. 通过无障碍接口静默点击 —— 不抢焦点、不移动鼠标、不改前台窗口
+
+**CDP 管道（后台/最小化/遮挡场景）**
+
+1. 读取 Antigravity 自带的调试端口（`%APPDATA%\Antigravity\DevToolsActivePort`），连接 browser 级 WebSocket（多客户端共存，与语言服务器的 CDP 发现互不干扰）
+2. `Target.attachToTarget` 挂到工作台页面，穿透 shadow DOM 查找弹窗选项，页面内 `.click()` —— 窗口状态完全无关
+3. 检测到 `chrome-error` 错误页时自动 `location.reload()` 修复
+
+两管道并存，谁先命中谁生效；日志见 `%APPDATA%\AntigravityAutoApprove\log.txt`
 
 ## 🔒 隐私与安全
 

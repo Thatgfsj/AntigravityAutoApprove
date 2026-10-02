@@ -8,5 +8,5 @@ if not exist "%LOCALAPPDATA%\AntigravityAutoApprove" mkdir "%LOCALAPPDATA%\Antig
   /out:"%LOCALAPPDATA%\AntigravityAutoApprove\AntigravityAutoApprove.exe" ^
   /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll ^
   /r:"%WPF%\UIAutomationClient.dll" /r:"%WPF%\UIAutomationTypes.dll" /r:"%WPF%\WindowsBase.dll" ^
-  "%~dp0AutoApprover.cs"
+  "%~dp0AutoApprover.cs" "%~dp0Cdp.cs"
 if %errorlevel%==0 (echo BUILD OK: %LOCALAPPDATA%\AntigravityAutoApprove\AntigravityAutoApprove.exe) else (echo BUILD FAILED)
