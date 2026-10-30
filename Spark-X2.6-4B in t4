@@ -1,0 +1,416 @@
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "provenance": [],
+      "gpuType": "T4",
+      "authorship_tag": "ABX9TyNiDgB1WYdej42KKeg8Pw+F",
+      "include_colab_link": true
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python"
+    },
+    "accelerator": "GPU"
+  },
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "view-in-github",
+        "colab_type": "text"
+      },
+      "source": [
+        "<a href=\"https://colab.research.google.com/github/Thatgfsj/AntigravityAutoApprove/blob/main/Spark-X2.6-4B%20in%20t4\" target=\"_parent\"><img src=\"https://colab.research.google.com/assets/colab-badge.svg\" alt=\"Open In Colab\"/></a>"
+      ]
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "逐步执行，第一步安装环境，第二步下载模型，第三步生成key,第四步启动公网前端+openai接口，第五步保活"
+      ],
+      "metadata": {
+        "id": "e9sPCxtxF78J"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "import subprocess\n",
+        "from pathlib import Path\n",
+        "\n",
+        "subprocess.run(\"rm -rf /usr/local/lib/python3.13/dist-packages/~riton*\", shell=True)\n",
+        "\n",
+        "subprocess.check_call([\"pip\", \"install\", \"-q\", \"-U\", \"uv\"])\n",
+        "if not Path(\"/content/venv/bin/python\").exists():\n",
+        "    subprocess.check_call([\"uv\", \"venv\", \"/content/venv\", \"--python\", \"3.12\", \"--seed\"])\n",
+        "\n",
+        "subprocess.check_call([\n",
+        "    \"uv\", \"pip\", \"install\", \"--python\", \"/content/venv/bin/python\",\n",
+        "    \"vllm\", \"open-webui\", \"requests\", \"jinja2\",\n",
+        "    \"huggingface_hub[hf_transfer]\",\n",
+        "    \"transformers==4.57.1\",\n",
+        "])\n",
+        "\n",
+        "r = subprocess.run([\n",
+        "    \"/content/venv/bin/python\", \"-c\",\n",
+        "    \"import vllm, transformers, huggingface_hub; \"\n",
+        "    \"print('vllm', vllm.__version__); \"\n",
+        "    \"print('transformers', transformers.__version__); \"\n",
+        "    \"print('hf_hub', huggingface_hub.__version__)\"\n",
+        "], capture_output=True, text=True)\n",
+        "print(r.stdout or r.stderr)\n",
+        "print(\"环境就绪\")\n"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "k76wvT-UDKiq",
+        "outputId": "97bcc4bc-ec23-4963-d451-82d9a5bd3111"
+      },
+      "execution_count": 2,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "vllm 0.11.0\n",
+            "transformers 4.57.1\n",
+            "hf_hub 0.36.2\n",
+            "\n",
+            "环境就绪\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "import subprocess, threading, time\n",
+        "from pathlib import Path\n",
+        "\n",
+        "MODEL_ID   = \"XHToken/Spark-X2.6-4B\"\n",
+        "MODEL_DIR  = Path(\"/content/models/Spark-X2.6-4B\")\n",
+        "MARKER     = MODEL_DIR / \".download_done\"\n",
+        "\n",
+        "if MARKER.exists() and any(MODEL_DIR.glob(\"*.safetensors\")):\n",
+        "    print(\"模型已下载，跳过\")\n",
+        "else:\n",
+        "    MODEL_DIR.mkdir(parents=True, exist_ok=True)\n",
+        "    done = False\n",
+        "\n",
+        "    def keepalive():\n",
+        "        for i in range(1, 10000):\n",
+        "            if done: break\n",
+        "            print(f\"下载中... 已运行 {i} 分钟\", flush=True)\n",
+        "            time.sleep(60)\n",
+        "\n",
+        "    threading.Thread(target=keepalive, daemon=True).start()\n",
+        "\n",
+        "    for attempt in range(1, 31):\n",
+        "        print(f\"===== 第 {attempt}/30 次尝试（断点续传）=====\", flush=True)\n",
+        "        r = subprocess.run([\n",
+        "            \"/content/venv/bin/python\", \"-m\",\n",
+        "            \"huggingface_hub.commands.huggingface_cli\",\n",
+        "            \"download\", MODEL_ID,\n",
+        "            \"--local-dir\", str(MODEL_DIR),\n",
+        "            \"--exclude\", \"*.pth\", \"*.onnx\", \"*.msgpack\", \"*.h5\",\n",
+        "        ])\n",
+        "        if r.returncode == 0:\n",
+        "            MARKER.touch()\n",
+        "            print(\"模型下载完成\")\n",
+        "            break\n",
+        "        print(\"中断，15 秒后自动续传...\", flush=True)\n",
+        "        time.sleep(15)\n",
+        "    else:\n",
+        "        raise RuntimeError(\"重试次数用尽，请重跑本单元格\")\n",
+        "\n",
+        "    done = True\n",
+        "\n",
+        "print(\"\\n关键文件：\")\n",
+        "for f in sorted(MODEL_DIR.rglob(\"*\")):\n",
+        "    if f.is_file():\n",
+        "        size = f.stat().st_size / 1024**3\n",
+        "        print(f\"  {f.name}  {f'{size:.2f} GB' if size >= 0.01 else ''}\")\n"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "cXVbIZv-DLP7",
+        "outputId": "e42a4935-b24c-4ea3-8e1a-10906fd15c59"
+      },
+      "execution_count": 3,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "下载中... 已运行 1 分钟\n",
+            "===== 第 1/30 次尝试（断点续传）=====\n",
+            "下载中... 已运行 2 分钟\n",
+            "模型下载完成\n",
+            "\n",
+            "关键文件：\n",
+            "  .gitignore  \n",
+            "  .gitattributes.lock  \n",
+            "  .gitattributes.metadata  \n",
+            "  LICENSE.lock  \n",
+            "  LICENSE.metadata  \n",
+            "  README.md.lock  \n",
+            "  README.md.metadata  \n",
+            "  chat_template.jinja.lock  \n",
+            "  chat_template.jinja.metadata  \n",
+            "  config.json.lock  \n",
+            "  config.json.metadata  \n",
+            "  configuration_spark.py.lock  \n",
+            "  configuration_spark.py.metadata  \n",
+            "  generation_config.json.lock  \n",
+            "  generation_config.json.metadata  \n",
+            "  .DS_Store.lock  \n",
+            "  .DS_Store.metadata  \n",
+            "  all_benchmark.svg.lock  \n",
+            "  all_benchmark.svg.metadata  \n",
+            "  benchmark.svg.lock  \n",
+            "  benchmark.svg.metadata  \n",
+            "  inference.svg.lock  \n",
+            "  inference.svg.metadata  \n",
+            "  xhtoken-wechat.jpg.lock  \n",
+            "  xhtoken-wechat.jpg.metadata  \n",
+            "  merges.txt.lock  \n",
+            "  merges.txt.metadata  \n",
+            "  model-00001-of-00005.safetensors.lock  \n",
+            "  model-00001-of-00005.safetensors.metadata  \n",
+            "  model-00002-of-00005.safetensors.lock  \n",
+            "  model-00002-of-00005.safetensors.metadata  \n",
+            "  model-00003-of-00005.safetensors.lock  \n",
+            "  model-00003-of-00005.safetensors.metadata  \n",
+            "  model-00004-of-00005.safetensors.lock  \n",
+            "  model-00004-of-00005.safetensors.metadata  \n",
+            "  model-00005-of-00005.safetensors.lock  \n",
+            "  model-00005-of-00005.safetensors.metadata  \n",
+            "  model.safetensors.index.json.lock  \n",
+            "  model.safetensors.index.json.metadata  \n",
+            "  modeling_spark.py.lock  \n",
+            "  modeling_spark.py.metadata  \n",
+            "  special_tokens_map.json.lock  \n",
+            "  special_tokens_map.json.metadata  \n",
+            "  tokenizer.json.lock  \n",
+            "  tokenizer.json.metadata  \n",
+            "  tokenizer_config.json.lock  \n",
+            "  tokenizer_config.json.metadata  \n",
+            "  vocab.json.lock  \n",
+            "  vocab.json.metadata  \n",
+            "  .download_done  \n",
+            "  .gitattributes  \n",
+            "  LICENSE  \n",
+            "  README.md  \n",
+            "  chat_template.jinja  \n",
+            "  config.json  \n",
+            "  configuration_spark.py  \n",
+            "  generation_config.json  \n",
+            "  .DS_Store  \n",
+            "  all_benchmark.svg  \n",
+            "  benchmark.svg  \n",
+            "  inference.svg  \n",
+            "  xhtoken-wechat.jpg  \n",
+            "  merges.txt  \n",
+            "  model-00001-of-00005.safetensors  1.85 GB\n",
+            "  model-00002-of-00005.safetensors  1.86 GB\n",
+            "  model-00003-of-00005.safetensors  1.86 GB\n",
+            "  model-00004-of-00005.safetensors  1.86 GB\n",
+            "  model-00005-of-00005.safetensors  0.24 GB\n",
+            "  model.safetensors.index.json  \n",
+            "  modeling_spark.py  \n",
+            "  special_tokens_map.json  \n",
+            "  tokenizer.json  \n",
+            "  tokenizer_config.json  \n",
+            "  vocab.json  \n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "import subprocess, secrets, time\n",
+        "from pathlib import Path\n",
+        "import urllib.request\n",
+        "\n",
+        "MODEL_DIR = \"/content/models/Spark-X2.6-4B\"\n",
+        "TEMPLATE  = Path(\"/content/chat_template.jinja\")\n",
+        "VLLM_PORT = 8000\n",
+        "\n",
+        "KEY_FILE = Path(\"/content/api_key.txt\")\n",
+        "if KEY_FILE.exists():\n",
+        "    API_KEY = KEY_FILE.read_text().strip()\n",
+        "else:\n",
+        "    API_KEY = secrets.token_hex(16)\n",
+        "    KEY_FILE.write_text(API_KEY)\n",
+        "\n",
+        "if not TEMPLATE.exists():\n",
+        "    urllib.request.urlretrieve(\n",
+        "        \"https://huggingface.co/XHToken/Spark-X2.6-4B/raw/main/chat_template.jinja\",\n",
+        "        TEMPLATE)\n",
+        "\n",
+        "subprocess.run(\"pkill -f 'vllm serve' || true\", shell=True)\n",
+        "time.sleep(3)\n",
+        "\n",
+        "log = open(\"/content/vllm.log\", \"w\")\n",
+        "subprocess.Popen([\n",
+        "    \"/content/venv/bin/vllm\", \"serve\", MODEL_DIR,\n",
+        "    \"--port\", str(VLLM_PORT),\n",
+        "    \"--trust-remote-code\",\n",
+        "    \"--served-model-name\", \"spark2.6\",\n",
+        "    \"--gpu-memory-utilization\", \"0.70\",\n",
+        "    \"--max-model-len\", \"8192\",\n",
+        "    \"--dtype\", \"float16\",\n",
+        "    \"--enable-prefix-caching\",\n",
+        "    \"--chat-template\", str(TEMPLATE),\n",
+        "    \"--api-key\", API_KEY,\n",
+        "], stdout=log, stderr=subprocess.STDOUT)\n",
+        "\n",
+        "print(\"vLLM 已后台启动\")\n",
+        "print(f\"API Key: {API_KEY}\")\n",
+        "print(\"查看进度: !tail -n 20 /content/vllm.log\")\n"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "e0ey_bGwDM8Q",
+        "outputId": "574ab4e4-9fa2-4d23-89c0-b2a582ae60e4"
+      },
+      "execution_count": 4,
+      "outputs": [
+        {
+          "output_type": "stream",
+          "name": "stdout",
+          "text": [
+            "vLLM 已后台启动\n",
+            "API Key: eade6952f652073a0d76de471477e115\n",
+            "查看进度: !tail -n 20 /content/vllm.log\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "import os, subprocess, time, urllib.request, secrets, re\n",
+        "from pathlib import Path\n",
+        "\n",
+        "VLLM_PORT, WEBUI_PORT = 8000, 8080\n",
+        "API_KEY = Path(\"/content/api_key.txt\").read_text().strip()\n",
+        "\n",
+        "def wait_ready(url, minutes, log_hint):\n",
+        "    for i in range(minutes * 12):\n",
+        "        time.sleep(5)\n",
+        "        try:\n",
+        "            with urllib.request.urlopen(url, timeout=3) as r:\n",
+        "                if r.status == 200:\n",
+        "                    return True\n",
+        "        except Exception:\n",
+        "            pass\n",
+        "    print(f\"等待超时，查看日志: !tail -n 50 {log_hint}\")\n",
+        "    return False\n",
+        "\n",
+        "print(\"等待 vLLM 就绪...\", flush=True)\n",
+        "if not wait_ready(f\"http://127.0.0.1:{VLLM_PORT}/health\", 15, \"/content/vllm.log\"):\n",
+        "    raise RuntimeError(\"vLLM 未就绪\")\n",
+        "print(\"vLLM 就绪\", flush=True)\n",
+        "\n",
+        "data_dir = Path(\"/content/open-webui-data\"); data_dir.mkdir(exist_ok=True)\n",
+        "os.environ.update({\n",
+        "    \"OPENAI_API_BASE_URL\": f\"http://127.0.0.1:{VLLM_PORT}/v1\",\n",
+        "    \"OPENAI_API_KEY\":      API_KEY,\n",
+        "    \"ENABLE_OPENAI_API\":   \"True\",\n",
+        "    \"WEBUI_SECRET_KEY\":    secrets.token_hex(32),\n",
+        "    \"DATA_DIR\":            str(data_dir),\n",
+        "    \"DEFAULT_MODELS\":      \"spark2.6\",\n",
+        "})\n",
+        "subprocess.run(\"pkill -f 'open-webui' || true\", shell=True)\n",
+        "subprocess.Popen(\n",
+        "    [\"/content/venv/bin/open-webui\", \"serve\", \"--port\", str(WEBUI_PORT)],\n",
+        "    stdout=open(\"/content/webui.log\", \"w\"), stderr=subprocess.STDOUT)\n",
+        "print(\"启动 Open WebUI ...\", flush=True)\n",
+        "if not wait_ready(f\"http://127.0.0.1:{WEBUI_PORT}/health\", 3, \"/content/webui.log\"):\n",
+        "    raise RuntimeError(\"Open WebUI 未就绪\")\n",
+        "print(\"Open WebUI 就绪\", flush=True)\n",
+        "\n",
+        "cf_path = Path(\"/content/cloudflared\")\n",
+        "if not cf_path.exists():\n",
+        "    urllib.request.urlretrieve(\n",
+        "        \"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64\",\n",
+        "        cf_path)\n",
+        "    cf_path.chmod(0o755)\n",
+        "\n",
+        "def create_tunnel(port, name):\n",
+        "    log_file = Path(f\"/content/tunnel_{name}.log\")\n",
+        "    subprocess.Popen(\n",
+        "        [str(cf_path), \"tunnel\", \"--url\", f\"http://127.0.0.1:{port}\"],\n",
+        "        stdout=open(log_file, \"w\"), stderr=subprocess.STDOUT)\n",
+        "    for _ in range(20):\n",
+        "        time.sleep(2)\n",
+        "        try:\n",
+        "            m = re.search(r\"https://[a-zA-Z0-9-]+\\.trycloudflare\\.com\", log_file.read_text())\n",
+        "            if m: return m.group(0)\n",
+        "        except Exception: pass\n",
+        "    return None\n",
+        "\n",
+        "webui_url = create_tunnel(WEBUI_PORT, \"webui\")\n",
+        "api_url   = create_tunnel(VLLM_PORT, \"api\")\n",
+        "\n",
+        "print(\"\\n\" + \"=\" * 66)\n",
+        "print(\"部署完成\")\n",
+        "print(\"=\" * 66)\n",
+        "print(f\"Open WebUI : {webui_url}\")\n",
+        "print(f\"首次访问注册管理员，模型选 spark2.6\")\n",
+        "print(f\"OpenAI API : {api_url}/v1\")\n",
+        "print(f\"模型名     : spark2.6\")\n",
+        "print(f\"API Key    : {API_KEY}\")\n",
+        "print(\"=\" * 66)\n",
+        "print(\"trycloudflare 域名在会话结束后失效，运行下一格保持会话活跃\")\n"
+      ],
+      "metadata": {
+        "colab": {
+          "base_uri": "https://localhost:8080/"
+        },
+        "id": "RMw7xcasDOYb",
+        "outputId": "dcd8511e-ca34-4732-db43-4a1a08e169a7"
+      },
+      "execution_count": null,
+      "outputs": [
+        {
+          "metadata": {
+            "tags": null
+          },
+          "name": "stdout",
+          "output_type": "stream",
+          "text": [
+            "等待 vLLM 就绪...\n"
+          ]
+        }
+      ]
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "import time, datetime\n",
+        "while True:\n",
+        "    print(f\"{datetime.datetime.now():%H:%M:%S} 服务运行中\", flush=True)\n",
+        "    time.sleep(60)\n"
+      ],
+      "metadata": {
+        "id": "Zn18u4TeDRCZ"
+      },
+      "execution_count": null,
+      "outputs": []
+    }
+  ]
+}
